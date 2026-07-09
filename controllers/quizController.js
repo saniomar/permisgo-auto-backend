@@ -5,6 +5,92 @@ import QuizAttempt from "../models/QuizAttempt.js";
 import RoadSign from "../models/RoadSign.js";
 import asyncHandler from "../utils/asyncHandler.js";
 import sendResponse from "../utils/ApiResponse.js";
+import QuizRetakePermission from "../models/QuizRetakePermission.js";
+import User from "../models/User.js";
+
+// ===============================Helper controller=======================
+const getQuizDurationSeconds = (quiz) => {
+  return Math.max(Number(quiz?.durationMinutes || 30), 1) * 60;
+};
+
+const getRemainingSeconds = (attempt, quiz) => {
+  if (!attempt?.startedAt) return getQuizDurationSeconds(quiz);
+
+  const durationSeconds = getQuizDurationSeconds(quiz);
+  const startedAtMs = new Date(attempt.startedAt).getTime();
+  const endAtMs = startedAtMs + durationSeconds * 1000;
+  const remainingMs = endAtMs - Date.now();
+
+  return Math.max(Math.ceil(remainingMs / 1000), 0);
+};
+
+const getAnsweredQuestionIds = (attempt) => {
+  return (attempt?.answers || []).map((answer) => String(answer.question));
+};
+
+const getSelectedAnswersMap = (attempt) => {
+  const selectedAnswers = {};
+
+  (attempt?.answers || []).forEach((answer) => {
+    selectedAnswers[String(answer.question)] = answer.selectedOptionIndex;
+  });
+
+  return selectedAnswers;
+};
+
+const getResumeIndex = (questions, attempt) => {
+  const answeredSet = new Set(getAnsweredQuestionIds(attempt));
+
+  const nextUnansweredIndex = questions.findIndex(
+    (question) => !answeredSet.has(String(question._id)),
+  );
+
+  if (nextUnansweredIndex !== -1) return nextUnansweredIndex;
+
+  return Math.max(questions.length - 1, 0);
+};
+
+const buildStudentAttemptPayload = ({
+  attempt,
+  quiz,
+  questions,
+  resumed = false,
+  retakePermissionUsed = false,
+}) => {
+  return {
+    attempt,
+    quiz,
+    questions: questions.map(sanitizeQuestionForStudent),
+    answeredQuestionIds: getAnsweredQuestionIds(attempt),
+    selectedAnswers: getSelectedAnswersMap(attempt),
+    resumeIndex: getResumeIndex(questions, attempt),
+    remainingSeconds: getRemainingSeconds(attempt, quiz),
+    resumed,
+    retakePermissionUsed,
+  };
+};
+
+const finishAttemptByServer = async (attempt, quiz) => {
+  if (!attempt || attempt.status !== "in_progress") return attempt;
+
+  calculateAttemptResult(attempt, quiz);
+  await attempt.save();
+
+  return attempt;
+};
+
+const finishAttemptIfTimeExpired = async (attempt, quiz) => {
+  if (!attempt || attempt.status !== "in_progress") return false;
+
+  const remainingSeconds = getRemainingSeconds(attempt, quiz);
+
+  if (remainingSeconds > 0) return false;
+
+  await finishAttemptByServer(attempt, quiz);
+  return true;
+};
+
+// ============================================helper====================================
 
 const toPublicFilePath = (file) => (file ? `/uploads/${file.filename}` : "");
 
@@ -169,7 +255,11 @@ export const getQuestions = asyncHandler(async (req, res) => {
 export const startQuizAttempt = asyncHandler(async (req, res) => {
   assertObjectId(req.params.quizId, "Invalid quiz id.");
 
-  const quiz = await Quiz.findOne({ _id: req.params.quizId, status: "active" });
+  const quiz = await Quiz.findOne({
+    _id: req.params.quizId,
+    status: "active",
+  });
+
   if (!quiz) {
     res.statusCode = 404;
     throw new Error("Active quiz not found.");
@@ -179,9 +269,71 @@ export const startQuizAttempt = asyncHandler(async (req, res) => {
     quiz: quiz._id,
     status: "active",
   }).sort({ order: 1, createdAt: 1 });
+
   if (!questions.length) {
     res.statusCode = 400;
     throw new Error("This quiz has no active questions.");
+  }
+
+  const existingInProgressAttempt = await QuizAttempt.findOne({
+    student: req.user._id,
+    quiz: quiz._id,
+    status: "in_progress",
+  }).sort({ createdAt: -1 });
+
+  if (existingInProgressAttempt) {
+    const timeExpired = await finishAttemptIfTimeExpired(
+      existingInProgressAttempt,
+      quiz,
+    );
+
+    const allQuestionsAnswered =
+      existingInProgressAttempt.answers.length >= questions.length;
+
+    if (!timeExpired && allQuestionsAnswered) {
+      await finishAttemptByServer(existingInProgressAttempt, quiz);
+    }
+
+    if (!timeExpired && !allQuestionsAnswered) {
+      return sendResponse(res, 200, "Existing quiz attempt resumed.", {
+        ...buildStudentAttemptPayload({
+          attempt: existingInProgressAttempt,
+          quiz,
+          questions,
+          resumed: true,
+        }),
+      });
+    }
+  }
+
+  const latestCompletedAttempt = await QuizAttempt.findOne({
+    student: req.user._id,
+    quiz: quiz._id,
+    status: "completed",
+  }).sort({ finishedAt: -1, createdAt: -1 });
+
+  let activeRetakePermission = null;
+
+  if (latestCompletedAttempt) {
+    activeRetakePermission = await QuizRetakePermission.findOne({
+      student: req.user._id,
+      quiz: quiz._id,
+      status: "active",
+    }).sort({ createdAt: -1 });
+
+    if (!activeRetakePermission) {
+      return sendResponse(
+        res,
+        409,
+        "Quiz time is over or this quiz is already completed. Please contact admin to allow retake.",
+        {
+          retakeLocked: true,
+          timeExpired: true,
+          latestAttempt: latestCompletedAttempt,
+          quiz,
+        },
+      );
+    }
   }
 
   const attempt = await QuizAttempt.create({
@@ -192,10 +344,21 @@ export const startQuizAttempt = asyncHandler(async (req, res) => {
     status: "in_progress",
   });
 
+  if (activeRetakePermission) {
+    activeRetakePermission.status = "used";
+    activeRetakePermission.usedAttempt = attempt._id;
+    activeRetakePermission.usedAt = new Date();
+    await activeRetakePermission.save();
+  }
+
   sendResponse(res, 201, "Quiz attempt started.", {
-    attempt,
-    quiz,
-    questions: questions.map(sanitizeQuestionForStudent),
+    ...buildStudentAttemptPayload({
+      attempt,
+      quiz,
+      questions,
+      resumed: false,
+      retakePermissionUsed: Boolean(activeRetakePermission),
+    }),
   });
 });
 
@@ -355,11 +518,133 @@ export const getQuizAttemptReview = asyncHandler(async (req, res) => {
 // Admin Quiz Management
 // =======================
 export const getAdminQuizzes = asyncHandler(async (req, res) => {
-  const quizzes = await Quiz.find({ status: { $ne: "deleted" } }).sort({
-    order: 1,
-    createdAt: -1,
+  const page = Math.max(Number(req.query.page) || 1, 1);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 10, 1), 100);
+  const skip = (page - 1) * limit;
+
+  const { search, type, status, isPaid } = req.query;
+
+  const filter = {
+    status: { $ne: "deleted" },
+  };
+
+  if (status && status !== "all") {
+    filter.status = status;
+  }
+
+  if (type && type !== "all") {
+    filter.type = type;
+  }
+
+  if (isPaid === "true") {
+    filter.isPaid = true;
+  }
+
+  if (isPaid === "false") {
+    filter.isPaid = false;
+  }
+
+  if (search && search.trim()) {
+    const regex = new RegExp(search.trim(), "i");
+
+    filter.$or = [
+      { title: regex },
+      { slug: regex },
+      { description: regex },
+      { type: regex },
+    ];
+  }
+
+  const [quizzes, total] = await Promise.all([
+    Quiz.find(filter)
+      .sort({ order: 1, createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean(),
+
+    Quiz.countDocuments(filter),
+  ]);
+
+  sendResponse(res, 200, "Admin quizzes fetched.", {
+    quizzes,
+    pagination: {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit) || 1,
+      hasNextPage: page * limit < total,
+      hasPrevPage: page > 1,
+    },
   });
-  sendResponse(res, 200, "Admin quizzes fetched.", quizzes);
+});
+
+export const getAdminQuizStats = asyncHandler(async (req, res) => {
+  const [
+    totalQuizzes,
+    activeQuizzes,
+    inactiveQuizzes,
+    paidQuizzes,
+    freeQuizzes,
+    totalQuestions,
+    activeQuestions,
+    totalAttempts,
+    completedAttempts,
+    passedAttempts,
+    averageScoreResult,
+    quizzesByType,
+  ] = await Promise.all([
+    Quiz.countDocuments({ status: { $ne: "deleted" } }),
+    Quiz.countDocuments({ status: "active" }),
+    Quiz.countDocuments({ status: "inactive" }),
+    Quiz.countDocuments({ status: { $ne: "deleted" }, isPaid: true }),
+    Quiz.countDocuments({ status: { $ne: "deleted" }, isPaid: false }),
+
+    Question.countDocuments({ status: { $ne: "deleted" } }),
+    Question.countDocuments({ status: "active" }),
+
+    QuizAttempt.countDocuments({}),
+    QuizAttempt.countDocuments({ status: "completed" }),
+    QuizAttempt.countDocuments({ status: "completed", passed: true }),
+
+    QuizAttempt.aggregate([
+      { $match: { status: "completed" } },
+      {
+        $group: {
+          _id: null,
+          averageScore: { $avg: "$percentage" },
+        },
+      },
+    ]),
+
+    Quiz.aggregate([
+      { $match: { status: { $ne: "deleted" } } },
+      {
+        $group: {
+          _id: "$type",
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { count: -1 } },
+    ]),
+  ]);
+
+  const failedAttempts = Math.max(completedAttempts - passedAttempts, 0);
+
+  sendResponse(res, 200, "Admin quiz stats fetched.", {
+    totalQuizzes,
+    activeQuizzes,
+    inactiveQuizzes,
+    paidQuizzes,
+    freeQuizzes,
+    totalQuestions,
+    activeQuestions,
+    totalAttempts,
+    completedAttempts,
+    passedAttempts,
+    failedAttempts,
+    averageScore: Math.round(averageScoreResult?.[0]?.averageScore || 0),
+    quizzesByType,
+  });
 });
 
 export const createQuiz = asyncHandler(async (req, res) => {
@@ -576,6 +861,168 @@ export const getAdminAttempts = asyncHandler(async (req, res) => {
   sendResponse(res, 200, "Admin attempts fetched.", attempts);
 });
 
+export const grantQuizRetakePermission = asyncHandler(async (req, res) => {
+  const { studentId, quizId, attemptId, reason = "" } = req.body;
+
+  assertObjectId(studentId, "Invalid student id.");
+  assertObjectId(quizId, "Invalid quiz id.");
+
+  if (attemptId) {
+    assertObjectId(attemptId, "Invalid attempt id.");
+  }
+
+  const student = await User.findOne({
+    _id: studentId,
+    role: "student",
+    status: { $ne: "blocked" },
+  });
+
+  if (!student) {
+    res.statusCode = 404;
+    throw new Error("Student not found.");
+  }
+
+  const quiz = await Quiz.findOne({
+    _id: quizId,
+    status: { $ne: "deleted" },
+  });
+
+  if (!quiz) {
+    res.statusCode = 404;
+    throw new Error("Quiz not found.");
+  }
+
+  if (attemptId) {
+    const attempt = await QuizAttempt.findOne({
+      _id: attemptId,
+      student: studentId,
+      quiz: quizId,
+    });
+
+    if (!attempt) {
+      res.statusCode = 404;
+      throw new Error("Attempt not found for this student and quiz.");
+    }
+  }
+
+  const existingActivePermission = await QuizRetakePermission.findOne({
+    student: studentId,
+    quiz: quizId,
+    status: "active",
+  })
+    .populate("student", "name email phone role")
+    .populate("quiz", "title type passingScore durationMinutes")
+    .populate("allowedBy", "name email role");
+
+  if (existingActivePermission) {
+    return sendResponse(
+      res,
+      200,
+      "Retake permission is already active for this student.",
+      existingActivePermission,
+    );
+  }
+
+  const permission = await QuizRetakePermission.create({
+    student: studentId,
+    quiz: quizId,
+    attempt: attemptId || null,
+    allowedBy: req.user._id,
+    reason,
+    status: "active",
+  });
+
+  const populatedPermission = await QuizRetakePermission.findById(
+    permission._id,
+  )
+    .populate("student", "name email phone role")
+    .populate("quiz", "title type passingScore durationMinutes")
+    .populate("attempt")
+    .populate("allowedBy", "name email role");
+
+  sendResponse(
+    res,
+    201,
+    "Retake permission enabled successfully.",
+    populatedPermission,
+  );
+});
+
+export const getAdminRetakePermissions = asyncHandler(async (req, res) => {
+  const { status = "all" } = req.query;
+
+  const filter = {};
+  if (status !== "all") {
+    filter.status = status;
+  }
+
+  const permissions = await QuizRetakePermission.find(filter)
+    .populate("student", "name email phone role")
+    .populate("quiz", "title type passingScore durationMinutes")
+    .populate("attempt")
+    .populate("usedAttempt")
+    .populate("allowedBy", "name email role")
+    .populate("revokedBy", "name email role")
+    .sort({ createdAt: -1 })
+    .limit(300);
+
+  sendResponse(res, 200, "Retake permissions fetched.", permissions);
+});
+
+export const getMyRetakePermissions = asyncHandler(async (req, res) => {
+  const permissions = await QuizRetakePermission.find({
+    student: req.user._id,
+    status: "active",
+  })
+    .populate("quiz", "title type coverImage passingScore durationMinutes")
+    .sort({ createdAt: -1 });
+
+  sendResponse(res, 200, "My active retake permissions fetched.", permissions);
+});
+
+export const revokeQuizRetakePermission = asyncHandler(async (req, res) => {
+  assertObjectId(req.params.permissionId, "Invalid permission id.");
+
+  const permission = await QuizRetakePermission.findById(
+    req.params.permissionId,
+  );
+
+  if (!permission) {
+    res.statusCode = 404;
+    throw new Error("Retake permission not found.");
+  }
+
+  if (permission.status !== "active") {
+    return sendResponse(
+      res,
+      400,
+      "Only active retake permission can be revoked.",
+      permission,
+    );
+  }
+
+  permission.status = "revoked";
+  permission.revokedBy = req.user._id;
+  permission.revokedAt = new Date();
+
+  await permission.save();
+
+  const populatedPermission = await QuizRetakePermission.findById(
+    permission._id,
+  )
+    .populate("student", "name email phone role")
+    .populate("quiz", "title type passingScore durationMinutes")
+    .populate("allowedBy", "name email role")
+    .populate("revokedBy", "name email role");
+
+  sendResponse(
+    res,
+    200,
+    "Retake permission revoked successfully.",
+    populatedPermission,
+  );
+});
+
 // =======================
 // Existing Road Signs
 // =======================
@@ -617,4 +1064,9 @@ export default {
   getAdminAttempts,
   getRoadSigns,
   createRoadSign,
+  getAdminQuizStats,
+  grantQuizRetakePermission,
+  getAdminRetakePermissions,
+  getMyRetakePermissions,
+  revokeQuizRetakePermission,
 };
