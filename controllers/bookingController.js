@@ -1,270 +1,1037 @@
-// import Booking from "../models/Booking";
-// import Lesson from "../models/Lesson";
-// import Notification from "../models/Notification";
-// import ROLES from "../importants/roles";
-// import asyncHandler from "../utils/asyncHandler";
-// import sendResponse from "../utils/ApiResponse";
-// import ApiError from "../utils/ApiError";
+// import mongoose from "mongoose";
+
+// import Booking from "../models/Booking.js";
+// import Lesson from "../models/Lesson.js";
+// import Notification from "../models/Notification.js";
+// import TeacherAvailability from "../models/TeacherAvailability.js";
+// import TeacherLocation from "../models/TeacherLocation.js";
+// import TeacherProfile from "../models/TeacherProfile.js";
+// import TeacherVehicle from "../models/TeacherVehicle.js";
+// import ApiError from "../utils/ApiError.js";
+// import sendResponse from "../utils/ApiResponse.js";
+// import asyncHandler from "../utils/asyncHandler.js";
+// import {
+//   ACTIVE_BOOKING_STATUSES,
+//   buildAvailableSlots,
+//   getId,
+//   getUtcDayRange,
+//   haversineDistanceKm,
+//   isTimeInsideWorkingSlots,
+//   normalizeTime,
+//   timeToMinutes,
+// } from "../utils/bookingAvailability.js";
+
+// const VEHICLE_TYPES = ["manual", "automatic", "electric"];
+// const BOOKING_STATUSES = [
+//   "pending",
+//   "confirmed",
+//   "rejected",
+//   "cancelled",
+//   "completed",
+//   "expired",
+// ];
+
+// const responseWindowMinutes = () => {
+//   const value = Number(process.env.BOOKING_RESPONSE_MINUTES || 360);
+//   return Number.isFinite(value) && value >= 15 ? value : 360;
+// };
+
+// const populateBooking = (query) =>
+//   query
+//     .populate("student", "name fullName email phone avatar")
+//     .populate("teacher", "name fullName email phone avatar")
+//     .populate("offer", "title salePrice category")
+//     .populate(
+//       "teacherLocation",
+//       "title address city postalCode placeId coordinates serviceRadiusKm meetingType status",
+//     )
+//     .populate(
+//       "teacherVehicle",
+//       "vehicleName vehicleType brand model modelYear registrationNumber vehicleImage approvalStatus status",
+//     )
+//     .populate(
+//       "lesson",
+//       "lessonDate startTime endTime duration status attendance lessonProgress",
+//     );
+
+// const createNotificationsSafely = async (items) => {
+//   if (!Array.isArray(items) || !items.length) return;
+
+//   try {
+//     await Notification.create(items);
+//   } catch (error) {
+//     console.error("Notification creation failed:", error.message);
+//   }
+// };
+
+// const canAccessBooking = (user, booking) => {
+//   if (user.role === "admin") return true;
+//   if (user.role === "student") return getId(booking.student) === getId(user);
+//   if (user.role === "teacher") return getId(booking.teacher) === getId(user);
+//   return false;
+// };
+
+// const locationPoint = (location) => {
+//   const lat = Number(
+//     location?.coordinates?.lat ?? location?.geoLocation?.coordinates?.[1],
+//   );
+//   const lng = Number(
+//     location?.coordinates?.lng ?? location?.geoLocation?.coordinates?.[0],
+//   );
+
+//   return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
+// };
+
+// const makeTeacherLocationSnapshot = (location, meetingType) => {
+//   const point = locationPoint(location);
+
+//   return {
+//     address: location.address || "",
+//     city: location.city || "",
+//     postalCode: location.postalCode || "",
+//     placeId: location.placeId || "",
+//     lat: point?.lat,
+//     lng: point?.lng,
+//     meetingType,
+//   };
+// };
+
+// const makeStudentLocationSnapshot = (studentLocation, meetingType) => ({
+//   address: String(studentLocation?.address || "").trim(),
+//   city: String(studentLocation?.city || "").trim(),
+//   postalCode: String(studentLocation?.postalCode || "").trim(),
+//   placeId: String(studentLocation?.placeId || "").trim(),
+//   lat: Number(studentLocation?.lat),
+//   lng: Number(studentLocation?.lng),
+//   meetingType,
+// });
+
+// const makeVehicleSnapshot = (vehicle) => ({
+//   vehicleName: vehicle.vehicleName || "",
+//   vehicleType: vehicle.vehicleType,
+//   brand: vehicle.brand || "",
+//   model: vehicle.model || "",
+//   modelYear: vehicle.modelYear,
+//   registrationNumber: vehicle.registrationNumber || "",
+//   vehicleImage: vehicle.vehicleImage || "",
+// });
+
+// const expirePendingBookings = async (extraFilter = {}) => {
+//   await Booking.updateMany(
+//     {
+//       ...extraFilter,
+//       status: "pending",
+//       expiresAt: { $ne: null, $lte: new Date() },
+//     },
+//     { $set: { status: "expired" } },
+//   );
+// };
+
+// const getOccupiedSlots = async (teacher, date) => {
+//   const { start, end } = getUtcDayRange(date);
+
+//   await expirePendingBookings({
+//     teacher,
+//     bookingDate: { $gte: start, $lte: end },
+//   });
+
+//   return Booking.find({
+//     teacher,
+//     bookingDate: { $gte: start, $lte: end },
+//     status: { $in: ACTIVE_BOOKING_STATUSES },
+//   })
+//     .select("startTime endTime status")
+//     .sort({ startTime: 1 })
+//     .lean();
+// };
+
+// const ensureNoConflict = async ({
+//   student,
+//   teacher,
+//   bookingDate,
+//   startTime,
+//   endTime,
+//   excludeBookingId,
+//   session,
+// }) => {
+//   const { start, end } = getUtcDayRange(bookingDate);
+//   const filter = {
+//     status: { $in: ACTIVE_BOOKING_STATUSES },
+//     bookingDate: { $gte: start, $lte: end },
+//     startTime: { $lt: endTime },
+//     endTime: { $gt: startTime },
+//     $or: [{ student }, { teacher }],
+//   };
+
+//   if (excludeBookingId) filter._id = { $ne: excludeBookingId };
+
+//   const query = Booking.findOne(filter).select(
+//     "student teacher startTime endTime",
+//   );
+//   if (session) query.session(session);
+
+//   const conflict = await query;
+//   if (!conflict) return;
+
+//   if (getId(conflict.teacher) === getId(teacher)) {
+//     throw new ApiError(
+//       409,
+//       `Teacher is already booked from ${conflict.startTime} to ${conflict.endTime}.`,
+//     );
+//   }
+
+//   throw new ApiError(
+//     409,
+//     `You already have a booking from ${conflict.startTime} to ${conflict.endTime}.`,
+//   );
+// };
+
+// const resolveMeetingType = ({ teacherLocation, meetingPreference }) => {
+//   if (teacherLocation.meetingType === "student_pickup") {
+//     return "student_pickup";
+//   }
+
+//   if (teacherLocation.meetingType === "both") {
+//     // A map booking already contains the student-selected point, so pickup is
+//     // the natural default. The frontend may explicitly request the teacher
+//     // meeting point by sending meetingPreference: "teacher_location".
+//     return meetingPreference === "teacher_location"
+//       ? "teacher_location"
+//       : "student_pickup";
+//   }
+
+//   return "teacher_location";
+// };
+
+// const getExpiryDate = () =>
+//   new Date(Date.now() + responseWindowMinutes() * 60 * 1000);
+
+// export const getTeacherAvailability = asyncHandler(async (req, res) => {
+//   const { teacher, date } = req.query;
+
+//   if (!teacher || !date) {
+//     throw new ApiError(400, "Teacher and date are required.");
+//   }
+
+//   const [occupiedSlots, availability] = await Promise.all([
+//     getOccupiedSlots(teacher, date),
+//     TeacherAvailability.findOne({ teacher }).lean(),
+//   ]);
+
+//   sendResponse(res, 200, "Teacher availability fetched successfully.", {
+//     teacher,
+//     date,
+//     occupiedSlots,
+//     availability,
+//   });
+// });
+
+// export const getAvailableSlots = asyncHandler(async (req, res) => {
+//   const { teacher, date, duration = 60 } = req.query;
+
+//   if (!teacher || !date) {
+//     throw new ApiError(400, "Teacher and date are required.");
+//   }
+
+//   const [occupiedSlots, availability] = await Promise.all([
+//     getOccupiedSlots(teacher, date),
+//     TeacherAvailability.findOne({ teacher }).lean(),
+//   ]);
+
+//   const availableSlots = buildAvailableSlots({
+//     availability,
+//     bookingDate: date,
+//     duration: Number(duration),
+//     occupiedSlots,
+//   });
+
+//   sendResponse(res, 200, "Available slots fetched successfully.", {
+//     teacher,
+//     date,
+//     duration: Number(duration),
+//     availableSlots,
+//     occupiedSlots,
+//   });
+// });
 
 // export const createBooking = asyncHandler(async (req, res) => {
-//   const booking = await Booking.create({ ...req.body, student: req.user._id });
+//   const {
+//     teacher,
+//     offer,
+//     locationId,
+//     vehicleType,
+//     bookingDate,
+//     startTime: rawStartTime,
+//     endTime: rawEndTime,
+//     studentLocation,
+//     meetingPreference,
+//   } = req.body;
 
-//   await Notification.create([
+//   if (
+//     !teacher ||
+//     !locationId ||
+//     !vehicleType ||
+//     !bookingDate ||
+//     !rawStartTime ||
+//     !rawEndTime
+//   ) {
+//     throw new ApiError(
+//       400,
+//       "Teacher, location, vehicle, date and time are required.",
+//     );
+//   }
+
+//   if (!VEHICLE_TYPES.includes(String(vehicleType).toLowerCase())) {
+//     throw new ApiError(
+//       400,
+//       "Vehicle type must be manual, automatic or electric.",
+//     );
+//   }
+
+//   const normalizedVehicleType = String(vehicleType).toLowerCase();
+
+//   const [profile, vehicle, teacherLocation, availability] = await Promise.all([
+//     TeacherProfile.findOne({
+//       user: teacher,
+//       verificationStatus: "verified",
+//       availabilityStatus: "available",
+//     }).populate("user", "status role"),
+//     TeacherVehicle.findOne({
+//       teacher,
+//       vehicleType: normalizedVehicleType,
+//       approvalStatus: "approved",
+//       status: "active",
+//     }),
+//     TeacherLocation.findOne({
+//       _id: locationId,
+//       teacher,
+//       status: "active",
+//     }),
+//     TeacherAvailability.findOne({ teacher }).lean(),
+//   ]);
+
+//   if (
+//     !profile?.user ||
+//     profile.user.status !== "active" ||
+//     profile.user.role !== "teacher"
+//   ) {
+//     throw new ApiError(400, "Selected teacher is not available.");
+//   }
+
+//   if (!vehicle) {
+//     throw new ApiError(
+//       400,
+//       `Teacher has no approved active ${normalizedVehicleType} vehicle.`,
+//     );
+//   }
+
+//   if (!teacherLocation) {
+//     throw new ApiError(400, "Selected lesson location is unavailable.");
+//   }
+
+//   const { date } = getUtcDayRange(bookingDate);
+//   const today = new Date();
+//   today.setUTCHours(0, 0, 0, 0);
+
+//   if (date < today) {
+//     throw new ApiError(400, "A booking cannot be created for a past date.");
+//   }
+
+//   const startTime = normalizeTime(rawStartTime, "Start time");
+//   const endTime = normalizeTime(rawEndTime, "End time");
+//   const duration = timeToMinutes(endTime) - timeToMinutes(startTime);
+
+//   if (duration < 30 || duration > 240) {
+//     throw new ApiError(
+//       400,
+//       "Lesson duration must be between 30 and 240 minutes.",
+//     );
+//   }
+
+//   if (
+//     !isTimeInsideWorkingSlots({
+//       availability,
+//       bookingDate: date,
+//       startTime,
+//       endTime,
+//     })
+//   ) {
+//     throw new ApiError(409, "Teacher is not working during the selected time.");
+//   }
+
+//   await expirePendingBookings({ student: req.user._id });
+//   await expirePendingBookings({ teacher });
+
+//   await ensureNoConflict({
+//     student: req.user._id,
+//     teacher,
+//     bookingDate: date,
+//     startTime,
+//     endTime,
+//   });
+
+//   const teacherPoint = locationPoint(teacherLocation);
+//   const studentLat = Number(studentLocation?.lat);
+//   const studentLng = Number(studentLocation?.lng);
+//   const hasStudentPoint =
+//     Number.isFinite(studentLat) && Number.isFinite(studentLng);
+
+//   const meetingType = resolveMeetingType({
+//     teacherLocation,
+//     meetingPreference,
+//   });
+
+//   if (meetingType === "student_pickup" && !hasStudentPoint) {
+//     throw new ApiError(
+//       400,
+//       "A valid student pickup point is required for this teacher location.",
+//     );
+//   }
+
+//   let distanceKm;
+//   if (teacherPoint && hasStudentPoint) {
+//     distanceKm = haversineDistanceKm(
+//       studentLat,
+//       studentLng,
+//       teacherPoint.lat,
+//       teacherPoint.lng,
+//     );
+
+//     if (distanceKm > Number(teacherLocation.serviceRadiusKm || 10)) {
+//       throw new ApiError(
+//         400,
+//         "This pickup/search point is outside the teacher's service radius.",
+//       );
+//     }
+//   }
+
+//   const studentSnapshot = hasStudentPoint
+//     ? makeStudentLocationSnapshot(studentLocation, "student_pickup")
+//     : undefined;
+
+//   const officialLocation =
+//     meetingType === "student_pickup"
+//       ? studentSnapshot
+//       : makeTeacherLocationSnapshot(teacherLocation, "teacher_location");
+
+//   const hourlyRate = Number(profile.hourlyRate) || 0;
+
+//   const booking = await Booking.create({
+//     student: req.user._id,
+//     teacher,
+//     offer: offer || undefined,
+//     teacherLocation: teacherLocation._id,
+//     teacherVehicle: vehicle._id,
+//     location: officialLocation,
+//     studentSearchLocation: studentSnapshot,
+//     vehicleSnapshot: makeVehicleSnapshot(vehicle),
+//     distanceKm: Number.isFinite(distanceKm)
+//       ? Number(distanceKm.toFixed(2))
+//       : undefined,
+//     vehicleType: normalizedVehicleType,
+//     bookingDate: date,
+//     startTime,
+//     endTime,
+//     duration,
+//     pricingSnapshot: {
+//       hourlyRate,
+//       subtotal: Number(((hourlyRate * duration) / 60).toFixed(2)),
+//       currency: process.env.DEFAULT_CURRENCY || "EUR",
+//     },
+//     status: "pending",
+//     expiresAt: getExpiryDate(),
+//   });
+
+//   await createNotificationsSafely([
 //     {
-//       user: booking.teacher,
+//       user: teacher,
 //       title: "New lesson booking request",
 //       message: "A student requested a driving lesson.",
 //       type: "booking",
-//       actionUrl: `/teacher/lessons`,
+//       actionUrl: `/teacher/lessons?tab=requests&bookingId=${booking._id}`,
 //     },
 //     {
-//       user: booking.student,
+//       user: req.user._id,
 //       title: "Booking request created",
-//       message: "Your lesson booking request has been created.",
+//       message: "Your request is waiting for teacher confirmation.",
 //       type: "booking",
-//       actionUrl: `/student/lessons`,
+//       actionUrl: `/student/lessons?tab=requests&bookingId=${booking._id}`,
 //     },
 //   ]);
 
-//   sendResponse(res, 201, "Booking created.", booking);
+//   const populated = await populateBooking(Booking.findById(booking._id));
+//   sendResponse(res, 201, "Booking request created successfully.", populated);
 // });
 
 // export const getBookings = asyncHandler(async (req, res) => {
 //   const filter = {};
-//   if (req.user.role === ROLES.STUDENT) filter.student = req.user._id;
-//   if (req.user.role === ROLES.TEACHER) filter.teacher = req.user._id;
 
-//   const bookings = await Booking.find(filter)
-//     .populate("student", "name email phone")
-//     .populate("teacher", "name email phone")
-//     .populate("offer", "title salePrice category")
-//     .sort({ createdAt: -1 });
+//   if (req.user.role === "student") filter.student = req.user._id;
+//   if (req.user.role === "teacher") filter.teacher = req.user._id;
 
-//   sendResponse(res, 200, "Bookings fetched.", bookings);
+//   if (req.query.status && req.query.status !== "all") {
+//     if (!BOOKING_STATUSES.includes(req.query.status)) {
+//       throw new ApiError(400, "Invalid booking status.");
+//     }
+//     filter.status = req.query.status;
+//   }
+
+//   await expirePendingBookings(filter);
+
+//   const bookings = await populateBooking(
+//     Booking.find(filter).sort({ bookingDate: -1, startTime: -1 }),
+//   );
+
+//   sendResponse(res, 200, "Bookings fetched successfully.", bookings);
 // });
 
 // export const getBooking = asyncHandler(async (req, res) => {
-//   const booking = await Booking.findById(req.params.id)
-//     .populate("student", "name email phone")
-//     .populate("teacher", "name email phone")
-//     .populate("offer");
+//   await expirePendingBookings({ _id: req.params.id });
+
+//   const booking = await populateBooking(Booking.findById(req.params.id));
 
 //   if (!booking) throw new ApiError(404, "Booking not found.");
-//   sendResponse(res, 200, "Booking fetched.", booking);
+//   if (!canAccessBooking(req.user, booking)) {
+//     throw new ApiError(403, "Access denied.");
+//   }
+
+//   sendResponse(res, 200, "Booking fetched successfully.", booking);
 // });
 
 // export const confirmBooking = asyncHandler(async (req, res) => {
-//   const booking = await Booking.findById(req.params.id);
-//   if (!booking) throw new ApiError(404, "Booking not found.");
+//   await expirePendingBookings({ _id: req.params.id });
 
-//   booking.status = "confirmed";
-//   await booking.save();
+//   const session = await mongoose.startSession();
+//   let bookingId;
+//   let lessonId;
 
-//   const lesson = await Lesson.create({
-//     booking: booking._id,
-//     student: booking.student,
-//     teacher: booking.teacher,
-//     lessonDate: booking.bookingDate,
-//     startTime: booking.startTime,
-//     endTime: booking.endTime,
-//     duration: booking.duration,
-//   });
+//   try {
+//     await session.withTransaction(async () => {
+//       const booking = await Booking.findById(req.params.id).session(session);
 
-//   await Notification.create({
-//     user: booking.student,
-//     title: "Booking confirmed",
-//     message: "Your lesson has been confirmed.",
-//     type: "booking",
-//     actionUrl: `/student/lessons/${lesson._id}`,
-//   });
+//       if (!booking) throw new ApiError(404, "Booking not found.");
 
-//   sendResponse(res, 200, "Booking confirmed and lesson created.", {
+//       if (
+//         req.user.role !== "admin" &&
+//         getId(booking.teacher) !== getId(req.user)
+//       ) {
+//         throw new ApiError(
+//           403,
+//           "Only the assigned teacher can confirm this booking.",
+//         );
+//       }
+
+//       if (booking.status === "confirmed") {
+//         const existingLesson =
+//           (booking.lesson &&
+//             (await Lesson.findById(booking.lesson).session(session))) ||
+//           (await Lesson.findOne({ booking: booking._id }).session(session));
+
+//         if (existingLesson) {
+//           if (!booking.lesson) {
+//             booking.lesson = existingLesson._id;
+//             await booking.save({ session });
+//           }
+//           bookingId = booking._id;
+//           lessonId = existingLesson._id;
+//           return;
+//         }
+//       }
+
+//       if (booking.status !== "pending") {
+//         throw new ApiError(400, "Only pending bookings can be confirmed.");
+//       }
+
+//       const availabilityQuery = TeacherAvailability.findOne({
+//         teacher: booking.teacher,
+//       })
+//         .session(session)
+//         .lean();
+
+//       const locationQuery = booking.teacherLocation
+//         ? TeacherLocation.findOne({
+//             _id: booking.teacherLocation,
+//             teacher: booking.teacher,
+//             status: "active",
+//           }).session(session)
+//         : Promise.resolve(null);
+
+//       // Existing pending bookings created before this upgrade did not save a
+//       // teacherVehicle reference, so fall back to the approved active vehicle.
+//       const vehicleQuery = TeacherVehicle.findOne({
+//         ...(booking.teacherVehicle
+//           ? { _id: booking.teacherVehicle }
+//           : { vehicleType: booking.vehicleType }),
+//         teacher: booking.teacher,
+//         approvalStatus: "approved",
+//         status: "active",
+//       }).session(session);
+
+//       const [availability, location, vehicle] = await Promise.all([
+//         availabilityQuery,
+//         locationQuery,
+//         vehicleQuery,
+//       ]);
+
+//       if (booking.teacherLocation && !location) {
+//         throw new ApiError(
+//           409,
+//           "The selected teacher location is no longer active.",
+//         );
+//       }
+
+//       if (!vehicle) {
+//         throw new ApiError(
+//           409,
+//           "The selected teacher vehicle is no longer available.",
+//         );
+//       }
+
+//       if (!booking.teacherVehicle) booking.teacherVehicle = vehicle._id;
+//       if (!booking.vehicleSnapshot) {
+//         booking.vehicleSnapshot = makeVehicleSnapshot(vehicle);
+//       }
+
+//       if (
+//         !isTimeInsideWorkingSlots({
+//           availability,
+//           bookingDate: booking.bookingDate,
+//           startTime: booking.startTime,
+//           endTime: booking.endTime,
+//         })
+//       ) {
+//         throw new ApiError(
+//           409,
+//           "The teacher is no longer available during the selected time.",
+//         );
+//       }
+
+//       await ensureNoConflict({
+//         student: booking.student,
+//         teacher: booking.teacher,
+//         bookingDate: booking.bookingDate,
+//         startTime: booking.startTime,
+//         endTime: booking.endTime,
+//         excludeBookingId: booking._id,
+//         session,
+//       });
+
+//       let lesson = await Lesson.findOne({ booking: booking._id }).session(
+//         session,
+//       );
+
+//       if (!lesson) {
+//         [lesson] = await Lesson.create(
+//           [
+//             {
+//               booking: booking._id,
+//               student: booking.student,
+//               teacher: booking.teacher,
+//               lessonDate: booking.bookingDate,
+//               startTime: booking.startTime,
+//               endTime: booking.endTime,
+//               duration: booking.duration,
+//               status: "scheduled",
+//               history: [
+//                 {
+//                   action: "created_from_booking",
+//                   by: req.user._id,
+//                   note: "Lesson created after booking confirmation.",
+//                 },
+//               ],
+//             },
+//           ],
+//           { session },
+//         );
+//       }
+
+//       booking.status = "confirmed";
+//       booking.lesson = lesson._id;
+//       booking.confirmation = {
+//         confirmedBy: req.user._id,
+//         confirmedAt: new Date(),
+//       };
+//       await booking.save({ session });
+
+//       bookingId = booking._id;
+//       lessonId = lesson._id;
+//     });
+//   } finally {
+//     await session.endSession();
+//   }
+
+//   const [booking, lesson] = await Promise.all([
+//     populateBooking(Booking.findById(bookingId)),
+//     Lesson.findById(lessonId)
+//       .populate("student", "name fullName email phone avatar")
+//       .populate("teacher", "name fullName email phone avatar")
+//       .populate("booking"),
+//   ]);
+
+//   await createNotificationsSafely([
+//     {
+//       user: booking.student?._id || booking.student,
+//       title: "Booking confirmed",
+//       message:
+//         "Your teacher confirmed the booking and your lesson is scheduled.",
+//       type: "booking",
+//       actionUrl: `/student/lessons?tab=upcoming&lessonId=${lesson._id}`,
+//     },
+//   ]);
+
+//   sendResponse(res, 200, "Booking confirmed and lesson created successfully.", {
 //     booking,
 //     lesson,
 //   });
 // });
 
-// export const cancelBooking = asyncHandler(async (req, res) => {
+// export const rejectBooking = asyncHandler(async (req, res) => {
+//   await expirePendingBookings({ _id: req.params.id });
+
 //   const booking = await Booking.findById(req.params.id);
+
 //   if (!booking) throw new ApiError(404, "Booking not found.");
 
-//   booking.status = "cancelled";
-//   booking.cancellation = {
-//     cancelledBy: req.user._id,
-//     reason: req.body.reason,
-//     cancelledAt: new Date(),
+//   if (req.user.role !== "admin" && getId(booking.teacher) !== getId(req.user)) {
+//     throw new ApiError(
+//       403,
+//       "Only the assigned teacher can reject this booking.",
+//     );
+//   }
+
+//   if (booking.status !== "pending") {
+//     throw new ApiError(400, "Only pending bookings can be rejected.");
+//   }
+
+//   const reason = String(req.body.reason || "Teacher is unavailable.").trim();
+
+//   booking.status = "rejected";
+//   booking.rejection = {
+//     rejectedBy: req.user._id,
+//     reason,
+//     rejectedAt: new Date(),
 //   };
 //   await booking.save();
 
-//   sendResponse(res, 200, "Booking cancelled.", booking);
+//   await createNotificationsSafely([
+//     {
+//       user: booking.student,
+//       title: "Booking rejected",
+//       message: `Your booking was rejected. Reason: ${reason}`,
+//       type: "booking",
+//       actionUrl: `/student/lessons?tab=requests&bookingId=${booking._id}`,
+//     },
+//   ]);
+
+//   const populated = await populateBooking(Booking.findById(booking._id));
+//   sendResponse(res, 200, "Booking rejected successfully.", populated);
 // });
+
+// export const cancelBooking = asyncHandler(async (req, res) => {
+//   await expirePendingBookings({ _id: req.params.id });
+
+//   const reason = String(req.body.reason || "").trim();
+//   if (!reason) throw new ApiError(400, "Cancellation reason is required.");
+
+//   const session = await mongoose.startSession();
+//   let bookingId;
+//   let notifyUser;
+//   let actionUrl;
+
+//   try {
+//     await session.withTransaction(async () => {
+//       const booking = await Booking.findById(req.params.id).session(session);
+
+//       if (!booking) throw new ApiError(404, "Booking not found.");
+//       if (!canAccessBooking(req.user, booking)) {
+//         throw new ApiError(403, "Access denied.");
+//       }
+
+//       if (
+//         ["cancelled", "rejected", "completed", "expired"].includes(
+//           booking.status,
+//         )
+//       ) {
+//         throw new ApiError(400, "This booking cannot be cancelled.");
+//       }
+
+//       if (req.user.role === "student" && booking.status !== "pending") {
+//         throw new ApiError(
+//           400,
+//           "A confirmed lesson must be cancelled through the lesson cancellation request.",
+//         );
+//       }
+
+//       booking.status = "cancelled";
+//       booking.cancellation = {
+//         cancelledBy: req.user._id,
+//         reason,
+//         cancelledAt: new Date(),
+//       };
+//       await booking.save({ session });
+
+//       if (booking.lesson) {
+//         await Lesson.findOneAndUpdate(
+//           {
+//             _id: booking.lesson,
+//             status: { $in: ["scheduled", "in_progress"] },
+//           },
+//           {
+//             $set: {
+//               status: "cancelled",
+//               cancellation: {
+//                 cancelledBy: req.user._id,
+//                 reason,
+//                 cancelledAt: new Date(),
+//               },
+//             },
+//             $push: {
+//               history: {
+//                 action: "cancelled_from_booking",
+//                 by: req.user._id,
+//                 note: reason,
+//               },
+//             },
+//           },
+//           { session },
+//         );
+//       }
+
+//       bookingId = booking._id;
+//       notifyUser =
+//         req.user.role === "student" ? booking.teacher : booking.student;
+//       actionUrl =
+//         req.user.role === "student"
+//           ? `/teacher/lessons?tab=requests&bookingId=${booking._id}`
+//           : `/student/lessons?tab=requests&bookingId=${booking._id}`;
+//     });
+//   } finally {
+//     await session.endSession();
+//   }
+
+//   await createNotificationsSafely([
+//     {
+//       user: notifyUser,
+//       title: "Booking cancelled",
+//       message: `A booking was cancelled. Reason: ${reason}`,
+//       type: "booking",
+//       actionUrl,
+//     },
+//   ]);
+
+//   const populated = await populateBooking(Booking.findById(bookingId));
+//   sendResponse(res, 200, "Booking cancelled successfully.", populated);
+// });
+
+import mongoose from "mongoose";
 
 import Booking from "../models/Booking.js";
 import Lesson from "../models/Lesson.js";
 import Notification from "../models/Notification.js";
+import TeacherAvailability from "../models/TeacherAvailability.js";
 import TeacherLocation from "../models/TeacherLocation.js";
 import TeacherProfile from "../models/TeacherProfile.js";
 import TeacherVehicle from "../models/TeacherVehicle.js";
 import ApiError from "../utils/ApiError.js";
 import sendResponse from "../utils/ApiResponse.js";
 import asyncHandler from "../utils/asyncHandler.js";
+import {
+  ACTIVE_BOOKING_STATUSES,
+  buildAvailableSlots,
+  getId,
+  getUtcDayRange,
+  haversineDistanceKm,
+  isTimeInsideWorkingSlots,
+  normalizeTime,
+  timeToMinutes,
+} from "../utils/bookingAvailability.js";
 
-const ACTIVE_BOOKING_STATUSES = ["pending", "confirmed"];
+const VEHICLE_TYPES = ["manual", "automatic", "electric"];
+const BOOKING_STATUSES = [
+  "pending",
+  "confirmed",
+  "rejected",
+  "cancelled",
+  "completed",
+  "no_show",
+  "expired",
+];
 
-const VEHICLE_TYPES = ["manual", "automatic"];
-
-const getId = (value) => {
-  return String(value?._id || value || "");
+const responseWindowMinutes = () => {
+  const value = Number(process.env.BOOKING_RESPONSE_MINUTES || 360);
+  return Number.isFinite(value) && value >= 15 ? value : 360;
 };
 
-const parseBookingDate = (value) => {
-  if (!value) {
-    throw new ApiError(400, "Booking date is required.");
-  }
+const populateBooking = (query) =>
+  query
+    .populate("student", "name fullName email phone avatar")
+    .populate("teacher", "name fullName email phone avatar")
+    .populate("offer", "title salePrice category")
+    .populate(
+      "teacherLocation",
+      "title address city postalCode placeId coordinates serviceRadiusKm meetingType status",
+    )
+    .populate(
+      "teacherVehicle",
+      "vehicleName vehicleType brand model modelYear registrationNumber vehicleImage approvalStatus status",
+    )
+    .populate(
+      "lesson",
+      "lessonDate startTime endTime duration status attendance lessonProgress",
+    );
 
-  const date = /^\d{4}-\d{2}-\d{2}$/.test(String(value))
-    ? new Date(`${value}T00:00:00.000Z`)
-    : new Date(value);
+const createNotificationsSafely = async (items) => {
+  if (!Array.isArray(items) || !items.length) return;
 
-  if (Number.isNaN(date.getTime())) {
-    throw new ApiError(400, "Invalid booking date.");
-  }
-
-  return date;
-};
-
-const getUtcDayRange = (value) => {
-  const date = parseBookingDate(value);
-
-  const start = new Date(date);
-
-  const end = new Date(date);
-
-  start.setUTCHours(0, 0, 0, 0);
-
-  end.setUTCHours(23, 59, 59, 999);
-
-  return {
-    date: start,
-    start,
-    end,
-  };
-};
-
-const normalizeTime = (value, label) => {
-  const match = String(value || "").match(/^(\d{1,2}):(\d{2})$/);
-
-  if (!match) {
-    throw new ApiError(400, `${label} must use HH:mm format.`);
-  }
-
-  const hour = Number(match[1]);
-
-  const minute = Number(match[2]);
-
-  if (hour > 23 || minute > 59) {
-    throw new ApiError(400, `Invalid ${label.toLowerCase()}.`);
-  }
-
-  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-};
-
-const timeToMinutes = (value) => {
-  const [hour, minute] = value.split(":").map(Number);
-
-  return hour * 60 + minute;
-};
-
-const createNotificationsSafely = async (notifications) => {
   try {
-    await Notification.create(notifications);
+    await Notification.create(items);
   } catch (error) {
     console.error("Notification creation failed:", error.message);
   }
 };
 
-const populateBooking = (query) => {
-  return query
-    .populate("student", "name email phone avatar")
-    .populate("teacher", "name email phone avatar")
-    .populate("offer", "title salePrice category");
-};
-
 const canAccessBooking = (user, booking) => {
-  if (user.role === "admin") {
-    return true;
-  }
-
-  if (user.role === "student") {
-    return getId(booking.student) === getId(user);
-  }
-
-  if (user.role === "teacher") {
-    return getId(booking.teacher) === getId(user);
-  }
-
+  if (user.role === "admin") return true;
+  if (user.role === "student") return getId(booking.student) === getId(user);
+  if (user.role === "teacher") return getId(booking.teacher) === getId(user);
   return false;
 };
 
-const ensureNoBookingConflict = async ({
+const locationPoint = (location) => {
+  const lat = Number(
+    location?.coordinates?.lat ?? location?.geoLocation?.coordinates?.[1],
+  );
+  const lng = Number(
+    location?.coordinates?.lng ?? location?.geoLocation?.coordinates?.[0],
+  );
+
+  return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
+};
+
+const makeTeacherLocationSnapshot = (location, meetingType) => {
+  const point = locationPoint(location);
+
+  return {
+    address: location.address || "",
+    city: location.city || "",
+    postalCode: location.postalCode || "",
+    placeId: location.placeId || "",
+    lat: point?.lat,
+    lng: point?.lng,
+    meetingType,
+  };
+};
+
+const makeStudentLocationSnapshot = (studentLocation, meetingType) => ({
+  address: String(studentLocation?.address || "").trim(),
+  city: String(studentLocation?.city || "").trim(),
+  postalCode: String(studentLocation?.postalCode || "").trim(),
+  placeId: String(studentLocation?.placeId || "").trim(),
+  lat: Number(studentLocation?.lat),
+  lng: Number(studentLocation?.lng),
+  meetingType,
+});
+
+const makeVehicleSnapshot = (vehicle) => ({
+  vehicleName: vehicle.vehicleName || "",
+  vehicleType: vehicle.vehicleType,
+  brand: vehicle.brand || "",
+  model: vehicle.model || "",
+  modelYear: vehicle.modelYear,
+  registrationNumber: vehicle.registrationNumber || "",
+  vehicleImage: vehicle.vehicleImage || "",
+});
+
+const expirePendingBookings = async (extraFilter = {}) => {
+  await Booking.updateMany(
+    {
+      ...extraFilter,
+      status: "pending",
+      expiresAt: { $ne: null, $lte: new Date() },
+    },
+    { $set: { status: "expired" } },
+  );
+};
+
+const getOccupiedSlots = async (teacher, date) => {
+  const { start, end } = getUtcDayRange(date);
+
+  await expirePendingBookings({
+    teacher,
+    bookingDate: { $gte: start, $lte: end },
+  });
+
+  return Booking.find({
+    teacher,
+    bookingDate: { $gte: start, $lte: end },
+    status: { $in: ACTIVE_BOOKING_STATUSES },
+  })
+    .select("startTime endTime status")
+    .sort({ startTime: 1 })
+    .lean();
+};
+
+const ensureNoConflict = async ({
   student,
   teacher,
   bookingDate,
   startTime,
   endTime,
+  excludeBookingId,
+  session,
 }) => {
   const { start, end } = getUtcDayRange(bookingDate);
+  const filter = {
+    status: { $in: ACTIVE_BOOKING_STATUSES },
+    bookingDate: { $gte: start, $lte: end },
+    startTime: { $lt: endTime },
+    endTime: { $gt: startTime },
+    $or: [{ student }, { teacher }],
+  };
 
-  const conflict = await Booking.findOne({
-    status: {
-      $in: ACTIVE_BOOKING_STATUSES,
-    },
+  if (excludeBookingId) filter._id = { $ne: excludeBookingId };
 
-    bookingDate: {
-      $gte: start,
-      $lte: end,
-    },
+  const query = Booking.findOne(filter).select(
+    "student teacher startTime endTime",
+  );
+  if (session) query.session(session);
 
-    startTime: {
-      $lt: endTime,
-    },
-
-    endTime: {
-      $gt: startTime,
-    },
-
-    $or: [
-      {
-        student,
-      },
-      {
-        teacher,
-      },
-    ],
-  }).select("student teacher startTime endTime");
-
-  if (!conflict) {
-    return;
-  }
+  const conflict = await query;
+  if (!conflict) return;
 
   if (getId(conflict.teacher) === getId(teacher)) {
     throw new ApiError(
       409,
-      `The teacher is already booked from ${conflict.startTime} to ${conflict.endTime}.`,
+      `Teacher is already booked from ${conflict.startTime} to ${conflict.endTime}.`,
     );
   }
 
   throw new ApiError(
     409,
-    `You already have another booking from ${conflict.startTime} to ${conflict.endTime}.`,
+    `You already have a booking from ${conflict.startTime} to ${conflict.endTime}.`,
   );
 };
 
-/**
- * GET /api/bookings/availability
- *
- * Teacher-এর কোন সময়গুলো occupied তা return করবে।
- */
+const resolveMeetingType = ({ teacherLocation, meetingPreference }) => {
+  if (teacherLocation.meetingType === "student_pickup") {
+    return "student_pickup";
+  }
+
+  if (teacherLocation.meetingType === "both") {
+    // A map booking already contains the student-selected point, so pickup is
+    // the natural default. The frontend may explicitly request the teacher
+    // meeting point by sending meetingPreference: "teacher_location".
+    return meetingPreference === "teacher_location"
+      ? "teacher_location"
+      : "student_pickup";
+  }
+
+  return "teacher_location";
+};
+
+const getExpiryDate = () =>
+  new Date(Date.now() + responseWindowMinutes() * 60 * 1000);
+
 export const getTeacherAvailability = asyncHandler(async (req, res) => {
   const { teacher, date } = req.query;
 
@@ -272,51 +1039,65 @@ export const getTeacherAvailability = asyncHandler(async (req, res) => {
     throw new ApiError(400, "Teacher and date are required.");
   }
 
-  const { start, end } = getUtcDayRange(date);
+  const [occupiedSlots, availability] = await Promise.all([
+    getOccupiedSlots(teacher, date),
+    TeacherAvailability.findOne({ teacher }).lean(),
+  ]);
 
-  const occupiedSlots = await Booking.find({
-    teacher,
-
-    bookingDate: {
-      $gte: start,
-      $lte: end,
-    },
-
-    status: {
-      $in: ACTIVE_BOOKING_STATUSES,
-    },
-  })
-    .select("startTime endTime status")
-    .sort({
-      startTime: 1,
-    });
-
-  sendResponse(res, 200, "Teacher occupied slots fetched successfully.", {
+  sendResponse(res, 200, "Teacher availability fetched successfully.", {
     teacher,
     date,
+    occupiedSlots,
+    availability,
+  });
+});
+
+export const getAvailableSlots = asyncHandler(async (req, res) => {
+  const { teacher, date, duration = 60 } = req.query;
+
+  if (!teacher || !date) {
+    throw new ApiError(400, "Teacher and date are required.");
+  }
+
+  const [occupiedSlots, availability] = await Promise.all([
+    getOccupiedSlots(teacher, date),
+    TeacherAvailability.findOne({ teacher }).lean(),
+  ]);
+
+  const availableSlots = buildAvailableSlots({
+    availability,
+    bookingDate: date,
+    duration: Number(duration),
+    occupiedSlots,
+  });
+
+  sendResponse(res, 200, "Available slots fetched successfully.", {
+    teacher,
+    date,
+    duration: Number(duration),
+    availableSlots,
     occupiedSlots,
   });
 });
 
-/**
- * POST /api/bookings
- *
- * Student booking request করবে।
- * এখানে Lesson তৈরি হবে না।
- */
 export const createBooking = asyncHandler(async (req, res) => {
   const {
     teacher,
     offer,
     locationId,
+    teacherVehicleId,
     vehicleType,
     bookingDate,
     startTime: rawStartTime,
     endTime: rawEndTime,
+    studentLocation,
+    meetingPreference,
   } = req.body;
 
   if (
     !teacher ||
+    !locationId ||
+    !teacherVehicleId ||
     !vehicleType ||
     !bookingDate ||
     !rawStartTime ||
@@ -324,72 +1105,71 @@ export const createBooking = asyncHandler(async (req, res) => {
   ) {
     throw new ApiError(
       400,
-      "Teacher, vehicle type, booking date, start time and end time are required.",
+      "Teacher, location, exact vehicle, date and time are required.",
     );
   }
 
-  if (!VEHICLE_TYPES.includes(vehicleType)) {
-    throw new ApiError(400, "Vehicle type must be manual or automatic.");
+  if (!mongoose.isValidObjectId(teacherVehicleId)) {
+    throw new ApiError(400, "Selected vehicle is invalid.");
   }
 
-  const teacherProfile = await TeacherProfile.findOne({
-    user: teacher,
-
-    verificationStatus: "verified",
-
-    availabilityStatus: "available",
-  }).populate("user", "name status role");
-
-  if (
-    !teacherProfile ||
-    !teacherProfile.user ||
-    teacherProfile.user.status !== "active" ||
-    teacherProfile.user.role !== "teacher"
-  ) {
-    throw new ApiError(400, "The selected teacher is not available.");
-  }
-
-  const matchingVehicle = await TeacherVehicle.findOne({
-    teacher,
-    vehicleType,
-    status: "active",
-  });
-
-  if (!matchingVehicle) {
+  if (!VEHICLE_TYPES.includes(String(vehicleType).toLowerCase())) {
     throw new ApiError(
       400,
-      `The selected teacher does not have an active ${vehicleType} vehicle.`,
+      "Vehicle type must be manual, automatic or electric.",
     );
   }
 
-  if (!locationId) {
-    throw new ApiError(400, "Please select a lesson location.");
+  const normalizedVehicleType = String(vehicleType).toLowerCase();
+
+  const [profile, vehicle, teacherLocation, availability] = await Promise.all([
+    TeacherProfile.findOne({
+      user: teacher,
+      verificationStatus: "verified",
+      availabilityStatus: "available",
+    }).populate("user", "status role"),
+    TeacherVehicle.findOne({
+      _id: teacherVehicleId,
+      teacher,
+      approvalStatus: "approved",
+      status: "active",
+    }),
+    TeacherLocation.findOne({
+      _id: locationId,
+      teacher,
+      status: "active",
+    }),
+    TeacherAvailability.findOne({ teacher }).lean(),
+  ]);
+
+  if (
+    !profile?.user ||
+    profile.user.status !== "active" ||
+    profile.user.role !== "teacher"
+  ) {
+    throw new ApiError(400, "Selected teacher is not available.");
   }
 
-  const selectedLocation = await TeacherLocation.findOne({
-    _id: locationId,
-    teacher,
-    status: "active",
-  });
-
-  if (!selectedLocation) {
-    throw new ApiError(400, "The selected lesson location is not available.");
+  if (!vehicle) {
+    throw new ApiError(
+      400,
+      "The selected vehicle does not belong to this teacher or is not admin-approved and active.",
+    );
   }
 
-  const location = {
-    address: selectedLocation.address,
+  if (vehicle.vehicleType !== normalizedVehicleType) {
+    throw new ApiError(
+      400,
+      "Selected vehicle type does not match the booking vehicle type.",
+    );
+  }
 
-    city: selectedLocation.city,
-
-    lat: selectedLocation.coordinates?.lat,
-
-    lng: selectedLocation.coordinates?.lng,
-  };
+  if (!teacherLocation) {
+    throw new ApiError(400, "Selected lesson location is unavailable.");
+  }
 
   const { date } = getUtcDayRange(bookingDate);
-
   const today = new Date();
-
   today.setUTCHours(0, 0, 0, 0);
 
   if (date < today) {
@@ -397,18 +1177,8 @@ export const createBooking = asyncHandler(async (req, res) => {
   }
 
   const startTime = normalizeTime(rawStartTime, "Start time");
-
   const endTime = normalizeTime(rawEndTime, "End time");
-
-  const startMinutes = timeToMinutes(startTime);
-
-  const endMinutes = timeToMinutes(endTime);
-
-  if (endMinutes <= startMinutes) {
-    throw new ApiError(400, "End time must be after start time.");
-  }
-
-  const duration = endMinutes - startMinutes;
+  const duration = timeToMinutes(endTime) - timeToMinutes(startTime);
 
   if (duration < 30 || duration > 240) {
     throw new ApiError(
@@ -417,198 +1187,373 @@ export const createBooking = asyncHandler(async (req, res) => {
     );
   }
 
-  await ensureNoBookingConflict({
+  if (
+    !isTimeInsideWorkingSlots({
+      availability,
+      bookingDate: date,
+      startTime,
+      endTime,
+    })
+  ) {
+    throw new ApiError(409, "Teacher is not working during the selected time.");
+  }
+
+  await expirePendingBookings({ student: req.user._id });
+  await expirePendingBookings({ teacher });
+
+  await ensureNoConflict({
     student: req.user._id,
-
     teacher,
-
     bookingDate: date,
-
     startTime,
-
     endTime,
   });
 
+  const teacherPoint = locationPoint(teacherLocation);
+  const studentLat = Number(studentLocation?.lat);
+  const studentLng = Number(studentLocation?.lng);
+  const hasStudentPoint =
+    Number.isFinite(studentLat) && Number.isFinite(studentLng);
+
+  const meetingType = resolveMeetingType({
+    teacherLocation,
+    meetingPreference,
+  });
+
+  if (meetingType === "student_pickup" && !hasStudentPoint) {
+    throw new ApiError(
+      400,
+      "A valid student pickup point is required for this teacher location.",
+    );
+  }
+
+  let distanceKm;
+  if (teacherPoint && hasStudentPoint) {
+    distanceKm = haversineDistanceKm(
+      studentLat,
+      studentLng,
+      teacherPoint.lat,
+      teacherPoint.lng,
+    );
+
+    if (distanceKm > Number(teacherLocation.serviceRadiusKm || 10)) {
+      throw new ApiError(
+        400,
+        "This pickup/search point is outside the teacher's service radius.",
+      );
+    }
+  }
+
+  const studentSnapshot = hasStudentPoint
+    ? makeStudentLocationSnapshot(studentLocation, "student_pickup")
+    : undefined;
+
+  const officialLocation =
+    meetingType === "student_pickup"
+      ? studentSnapshot
+      : makeTeacherLocationSnapshot(teacherLocation, "teacher_location");
+
+  const hourlyRate = Number(profile.hourlyRate) || 0;
+
   const booking = await Booking.create({
     student: req.user._id,
-
     teacher,
-
     offer: offer || undefined,
-
-    location,
-
-    vehicleType,
-
+    teacherLocation: teacherLocation._id,
+    teacherVehicle: vehicle._id,
+    location: officialLocation,
+    studentSearchLocation: studentSnapshot,
+    vehicleSnapshot: makeVehicleSnapshot(vehicle),
+    distanceKm: Number.isFinite(distanceKm)
+      ? Number(distanceKm.toFixed(2))
+      : undefined,
+    vehicleType: vehicle.vehicleType,
     bookingDate: date,
-
     startTime,
-
     endTime,
-
     duration,
-
+    pricingSnapshot: {
+      hourlyRate,
+      subtotal: Number(((hourlyRate * duration) / 60).toFixed(2)),
+      currency: process.env.DEFAULT_CURRENCY || "EUR",
+    },
     status: "pending",
+    expiresAt: getExpiryDate(),
   });
 
   await createNotificationsSafely([
     {
       user: teacher,
-
       title: "New lesson booking request",
-
       message: "A student requested a driving lesson.",
-
       type: "booking",
-
-      actionUrl: "/teacher/lessons",
+      actionUrl: `/teacher/lessons?tab=requests&bookingId=${booking._id}`,
     },
-
     {
       user: req.user._id,
-
       title: "Booking request created",
-
-      message: "Your booking request is waiting for teacher confirmation.",
-
+      message: "Your request is waiting for teacher confirmation.",
       type: "booking",
-
-      actionUrl: "/student/lessons",
+      actionUrl: `/student/lessons?tab=requests&bookingId=${booking._id}`,
     },
   ]);
 
-  const populatedBooking = await populateBooking(Booking.findById(booking._id));
-
-  sendResponse(
-    res,
-    201,
-    "Booking request created successfully.",
-    populatedBooking,
-  );
+  const populated = await populateBooking(Booking.findById(booking._id));
+  sendResponse(res, 201, "Booking request created successfully.", populated);
 });
 
-/**
- * GET /api/bookings
- */
 export const getBookings = asyncHandler(async (req, res) => {
   const filter = {};
 
-  if (req.user.role === "student") {
-    filter.student = req.user._id;
-  }
-
-  if (req.user.role === "teacher") {
-    filter.teacher = req.user._id;
-  }
+  if (req.user.role === "student") filter.student = req.user._id;
+  if (req.user.role === "teacher") filter.teacher = req.user._id;
 
   if (req.query.status && req.query.status !== "all") {
+    if (!BOOKING_STATUSES.includes(req.query.status)) {
+      throw new ApiError(400, "Invalid booking status.");
+    }
     filter.status = req.query.status;
   }
 
-  const bookings = await populateBooking(
-    Booking.find(filter).sort({
-      bookingDate: -1,
-
-      startTime: -1,
-    }),
-  );
-
-  sendResponse(res, 200, "Bookings fetched successfully.", bookings);
-});
-
-/**
- * GET /api/bookings/:id
- */
-export const getBooking = asyncHandler(async (req, res) => {
-  const booking = await populateBooking(Booking.findById(req.params.id));
-
-  if (!booking) {
-    throw new ApiError(404, "Booking not found.");
+  if (req.query.dateFrom || req.query.dateTo) {
+    filter.bookingDate = {};
+    if (req.query.dateFrom) {
+      filter.bookingDate.$gte = getUtcDayRange(req.query.dateFrom).start;
+    }
+    if (req.query.dateTo) {
+      filter.bookingDate.$lte = getUtcDayRange(req.query.dateTo).end;
+    }
   }
 
+  await expirePendingBookings(filter);
+
+  const page = Math.max(Number(req.query.page) || 1, 1);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 10, 1), 100);
+  const skip = (page - 1) * limit;
+  const roleFilter = {};
+  if (req.user.role === "student") roleFilter.student = req.user._id;
+  if (req.user.role === "teacher") roleFilter.teacher = req.user._id;
+
+  const [bookings, total, statusRows] = await Promise.all([
+    populateBooking(
+      Booking.find(filter)
+        .sort({ bookingDate: -1, startTime: -1, _id: -1 })
+        .skip(skip)
+        .limit(limit),
+    ),
+    Booking.countDocuments(filter),
+    Booking.aggregate([
+      { $match: roleFilter },
+      { $group: { _id: "$status", count: { $sum: 1 } } },
+    ]),
+  ]);
+
+  const statusCounts = statusRows.reduce(
+    (result, row) => ({ ...result, [row._id]: row.count }),
+    {},
+  );
+  statusCounts.all = statusRows.reduce((sum, row) => sum + row.count, 0);
+
+  sendResponse(res, 200, "Bookings fetched successfully.", bookings, {
+    page,
+    limit,
+    total,
+    totalPages: Math.max(Math.ceil(total / limit), 1),
+    statusCounts,
+  });
+});
+
+export const getBooking = asyncHandler(async (req, res) => {
+  await expirePendingBookings({ _id: req.params.id });
+
+  const booking = await populateBooking(Booking.findById(req.params.id));
+
+  if (!booking) throw new ApiError(404, "Booking not found.");
   if (!canAccessBooking(req.user, booking)) {
-    throw new ApiError(403, "You are not allowed to access this booking.");
+    throw new ApiError(403, "Access denied.");
   }
 
   sendResponse(res, 200, "Booking fetched successfully.", booking);
 });
 
-/**
- * PATCH /api/bookings/:id/confirm
- *
- * Teacher confirm করলে Lesson automatic তৈরি হবে।
- */
 export const confirmBooking = asyncHandler(async (req, res) => {
-  const booking = await Booking.findById(req.params.id);
+  await expirePendingBookings({ _id: req.params.id });
 
-  if (!booking) {
-    throw new ApiError(404, "Booking not found.");
-  }
-
-  const isAssignedTeacher = getId(booking.teacher) === getId(req.user);
-
-  if (req.user.role !== "admin" && !isAssignedTeacher) {
-    throw new ApiError(
-      403,
-      "Only the assigned teacher can confirm this booking.",
-    );
-  }
-
-  const existingLesson = await Lesson.findOne({
-    booking: booking._id,
-  });
-
-  if (booking.status === "confirmed" && existingLesson) {
-    return sendResponse(res, 200, "Booking is already confirmed.", {
-      booking,
-      lesson: existingLesson,
-    });
-  }
-
-  if (booking.status !== "pending") {
-    throw new ApiError(400, "Only a pending booking can be confirmed.");
-  }
-
-  const lesson = await Lesson.create({
-    booking: booking._id,
-
-    student: booking.student,
-
-    teacher: booking.teacher,
-
-    lessonDate: booking.bookingDate,
-
-    startTime: booking.startTime,
-
-    endTime: booking.endTime,
-
-    duration: booking.duration,
-
-    status: "scheduled",
-  });
+  const session = await mongoose.startSession();
+  let bookingId;
+  let lessonId;
 
   try {
-    booking.status = "confirmed";
+    await session.withTransaction(async () => {
+      const booking = await Booking.findById(req.params.id).session(session);
 
-    await booking.save();
-  } catch (error) {
-    await Lesson.findByIdAndDelete(lesson._id);
+      if (!booking) throw new ApiError(404, "Booking not found.");
 
-    throw error;
+      if (
+        req.user.role !== "teacher" ||
+        getId(booking.teacher) !== getId(req.user._id)
+      ) {
+        throw new ApiError(
+          403,
+          "Only the assigned teacher can confirm this booking.",
+        );
+      }
+
+      if (booking.status === "confirmed") {
+        const existingLesson =
+          (booking.lesson &&
+            (await Lesson.findById(booking.lesson).session(session))) ||
+          (await Lesson.findOne({ booking: booking._id }).session(session));
+
+        if (existingLesson) {
+          if (!booking.lesson) {
+            booking.lesson = existingLesson._id;
+            await booking.save({ session });
+          }
+          bookingId = booking._id;
+          lessonId = existingLesson._id;
+          return;
+        }
+      }
+
+      if (booking.status !== "pending") {
+        throw new ApiError(400, "Only pending bookings can be confirmed.");
+      }
+
+      const availabilityQuery = TeacherAvailability.findOne({
+        teacher: booking.teacher,
+      })
+        .session(session)
+        .lean();
+
+      const locationQuery = booking.teacherLocation
+        ? TeacherLocation.findOne({
+            _id: booking.teacherLocation,
+            teacher: booking.teacher,
+            status: "active",
+          }).session(session)
+        : Promise.resolve(null);
+
+      // Existing pending bookings created before this upgrade did not save a
+      // teacherVehicle reference, so fall back to the approved active vehicle.
+      const vehicleQuery = TeacherVehicle.findOne({
+        ...(booking.teacherVehicle
+          ? { _id: booking.teacherVehicle }
+          : { vehicleType: booking.vehicleType }),
+        teacher: booking.teacher,
+        approvalStatus: "approved",
+        status: "active",
+      }).session(session);
+
+      const [availability, location, vehicle] = await Promise.all([
+        availabilityQuery,
+        locationQuery,
+        vehicleQuery,
+      ]);
+
+      if (booking.teacherLocation && !location) {
+        throw new ApiError(
+          409,
+          "The selected teacher location is no longer active.",
+        );
+      }
+
+      if (!vehicle) {
+        throw new ApiError(
+          409,
+          "The selected teacher vehicle is no longer available.",
+        );
+      }
+
+      if (!booking.teacherVehicle) booking.teacherVehicle = vehicle._id;
+      if (!booking.vehicleSnapshot) {
+        booking.vehicleSnapshot = makeVehicleSnapshot(vehicle);
+      }
+
+      if (
+        !isTimeInsideWorkingSlots({
+          availability,
+          bookingDate: booking.bookingDate,
+          startTime: booking.startTime,
+          endTime: booking.endTime,
+        })
+      ) {
+        throw new ApiError(
+          409,
+          "The teacher is no longer available during the selected time.",
+        );
+      }
+
+      await ensureNoConflict({
+        student: booking.student,
+        teacher: booking.teacher,
+        bookingDate: booking.bookingDate,
+        startTime: booking.startTime,
+        endTime: booking.endTime,
+        excludeBookingId: booking._id,
+        session,
+      });
+
+      let lesson = await Lesson.findOne({ booking: booking._id }).session(
+        session,
+      );
+
+      if (!lesson) {
+        [lesson] = await Lesson.create(
+          [
+            {
+              booking: booking._id,
+              student: booking.student,
+              teacher: booking.teacher,
+              lessonDate: booking.bookingDate,
+              startTime: booking.startTime,
+              endTime: booking.endTime,
+              duration: booking.duration,
+              status: "scheduled",
+              history: [
+                {
+                  action: "created_from_booking",
+                  by: req.user._id,
+                  note: "Lesson created after booking confirmation.",
+                },
+              ],
+            },
+          ],
+          { session },
+        );
+      }
+
+      booking.status = "confirmed";
+      booking.lesson = lesson._id;
+      booking.confirmation = {
+        confirmedBy: req.user._id,
+        confirmedAt: new Date(),
+      };
+      await booking.save({ session });
+
+      bookingId = booking._id;
+      lessonId = lesson._id;
+    });
+  } finally {
+    await session.endSession();
   }
+
+  const [booking, lesson] = await Promise.all([
+    populateBooking(Booking.findById(bookingId)),
+    Lesson.findById(lessonId)
+      .populate("student", "name fullName email phone avatar")
+      .populate("teacher", "name fullName email phone avatar")
+      .populate("booking"),
+  ]);
 
   await createNotificationsSafely([
     {
-      user: booking.student,
-
+      user: booking.student?._id || booking.student,
       title: "Booking confirmed",
-
       message:
-        "Your teacher confirmed the booking and your lesson is now scheduled.",
-
+        "Your teacher confirmed the booking and your lesson is scheduled.",
       type: "booking",
-
-      actionUrl: `/student/lessons/${lesson._id}`,
+      actionUrl: `/student/lessons?tab=upcoming&lessonId=${lesson._id}`,
     },
   ]);
 
@@ -618,74 +1563,143 @@ export const confirmBooking = asyncHandler(async (req, res) => {
   });
 });
 
-/**
- * PATCH /api/bookings/:id/cancel
- */
-export const cancelBooking = asyncHandler(async (req, res) => {
+export const rejectBooking = asyncHandler(async (req, res) => {
+  await expirePendingBookings({ _id: req.params.id });
+
   const booking = await Booking.findById(req.params.id);
 
-  if (!booking) {
-    throw new ApiError(404, "Booking not found.");
+  if (!booking) throw new ApiError(404, "Booking not found.");
+
+  if (
+    req.user.role !== "teacher" ||
+    getId(booking.teacher) !== getId(req.user._id)
+  ) {
+    throw new ApiError(
+      403,
+      "Only the assigned teacher can reject this booking.",
+    );
   }
 
-  if (!canAccessBooking(req.user, booking)) {
-    throw new ApiError(403, "You are not allowed to cancel this booking.");
+  if (booking.status !== "pending") {
+    throw new ApiError(400, "Only pending bookings can be rejected.");
   }
 
-  if (["cancelled", "completed"].includes(booking.status)) {
-    throw new ApiError(400, "This booking cannot be cancelled.");
-  }
+  const reason = String(req.body.reason || "Teacher is unavailable.").trim();
 
-  const reason = String(req.body.reason || "").trim();
-
-  if (!reason) {
-    throw new ApiError(400, "Cancellation reason is required.");
-  }
-
-  booking.status = "cancelled";
-
-  booking.cancellation = {
-    cancelledBy: req.user._id,
-
+  booking.status = "rejected";
+  booking.rejection = {
+    rejectedBy: req.user._id,
     reason,
-
-    cancelledAt: new Date(),
+    rejectedAt: new Date(),
   };
-
   await booking.save();
 
-  await Lesson.findOneAndUpdate(
+  await createNotificationsSafely([
     {
-      booking: booking._id,
-
-      status: {
-        $in: ["scheduled", "in_progress"],
-      },
+      user: booking.student,
+      title: "Booking rejected",
+      message: `Your booking was rejected. Reason: ${reason}`,
+      type: "booking",
+      actionUrl: `/student/lessons?tab=requests&bookingId=${booking._id}`,
     },
-    {
-      status: "cancelled",
-    },
-  );
+  ]);
 
-  const notifyUser =
-    req.user.role === "student" ? booking.teacher : booking.student;
+  const populated = await populateBooking(Booking.findById(booking._id));
+  sendResponse(res, 200, "Booking rejected successfully.", populated);
+});
+
+export const cancelBooking = asyncHandler(async (req, res) => {
+  await expirePendingBookings({ _id: req.params.id });
+
+  const reason = String(req.body.reason || "").trim();
+  if (!reason) throw new ApiError(400, "Cancellation reason is required.");
+
+  const session = await mongoose.startSession();
+  let bookingId;
+  let notifyUser;
+  let actionUrl;
+
+  try {
+    await session.withTransaction(async () => {
+      const booking = await Booking.findById(req.params.id).session(session);
+
+      if (!booking) throw new ApiError(404, "Booking not found.");
+      if (!canAccessBooking(req.user, booking)) {
+        throw new ApiError(403, "Access denied.");
+      }
+
+      if (
+        ["cancelled", "rejected", "completed", "no_show", "expired"].includes(
+          booking.status,
+        )
+      ) {
+        throw new ApiError(400, "This booking cannot be cancelled.");
+      }
+
+      if (req.user.role === "student" && booking.status !== "pending") {
+        throw new ApiError(
+          400,
+          "A confirmed lesson must be cancelled through the lesson cancellation request.",
+        );
+      }
+
+      booking.status = "cancelled";
+      booking.cancellation = {
+        cancelledBy: req.user._id,
+        reason,
+        cancelledAt: new Date(),
+      };
+      await booking.save({ session });
+
+      if (booking.lesson) {
+        await Lesson.findOneAndUpdate(
+          {
+            _id: booking.lesson,
+            status: { $in: ["scheduled", "in_progress"] },
+          },
+          {
+            $set: {
+              status: "cancelled",
+              cancellation: {
+                cancelledBy: req.user._id,
+                reason,
+                cancelledAt: new Date(),
+              },
+            },
+            $push: {
+              history: {
+                action: "cancelled_from_booking",
+                by: req.user._id,
+                note: reason,
+              },
+            },
+          },
+          { session },
+        );
+      }
+
+      bookingId = booking._id;
+      notifyUser =
+        req.user.role === "student" ? booking.teacher : booking.student;
+      actionUrl =
+        req.user.role === "student"
+          ? `/teacher/lessons?tab=requests&bookingId=${booking._id}`
+          : `/student/lessons?tab=requests&bookingId=${booking._id}`;
+    });
+  } finally {
+    await session.endSession();
+  }
 
   await createNotificationsSafely([
     {
       user: notifyUser,
-
       title: "Booking cancelled",
-
       message: `A booking was cancelled. Reason: ${reason}`,
-
       type: "booking",
-
-      actionUrl:
-        req.user.role === "student" ? "/teacher/lessons" : "/student/lessons",
+      actionUrl,
     },
   ]);
 
-  const populatedBooking = await populateBooking(Booking.findById(booking._id));
-
-  sendResponse(res, 200, "Booking cancelled successfully.", populatedBooking);
+  const populated = await populateBooking(Booking.findById(bookingId));
+  sendResponse(res, 200, "Booking cancelled successfully.", populated);
 });

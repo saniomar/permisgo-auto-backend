@@ -31,7 +31,7 @@ import documentRoutes from "./routes/documentRoutes.js";
 // import reviewRoutes from"./routes/reviewRoutes.js";
 // import referralRoutes from"./routes/referralRoutes.js";
 
-// import examRoutes from"./routes/examRoutes.js";
+import examRoutes from "./routes/examRoutes.js";
 
 connectDB();
 
@@ -107,7 +107,7 @@ app.use("/api/lessons", lessonRoutes);
 app.use("/api/students", studentRoutes);
 app.use("/api/teachers", teacherRoutes);
 app.use("/api/offers", offerRoutes);
-//app.use("/api/bookings", bookingRoutes);
+app.use("/api/bookings", bookingRoutes);
 //app.use("/api/payments", paymentRoutes);
 app.use("/api/documents", documentRoutes);
 //app.use("/api/blogs", blogRoutes);
@@ -118,7 +118,7 @@ app.use("/api/documents", documentRoutes);
 //app.use("/api/reviews", reviewRoutes);
 //app.use("/api/referrals", referralRoutes);
 
-//app.use("/api/exams", examRoutes);
+app.use("/api/exams", examRoutes);
 //app.use("/api/admin", adminRoutes);
 
 app.use(notFound);
